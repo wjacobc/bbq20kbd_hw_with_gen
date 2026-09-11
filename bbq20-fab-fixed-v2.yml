@@ -1,0 +1,216 @@
+name: Build BBQ20 JLCPCB files
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Upstream solderparty/bbq20kbd_hw branch, tag, or commit"
+        required: true
+        default: "main"
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out Solder Party BBQ20 hardware
+        uses: actions/checkout@v4
+        with:
+          repository: solderparty/bbq20kbd_hw
+          ref: ${{ inputs.source_ref }}
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Export KiCad manufacturing data
+        uses: actions-for-kicad/kicad-actions@v2-k10.0
+        with:
+          project_file_name: ./bbq20_keyboard.kicad_pro
+          schematic_file_name: ./bbq20_keyboard.kicad_sch
+          schematic_output_bom: true
+          schematic_output_bom_file_name: raw_bom.csv
+          schematic_output_bom_fields: 'Reference,Value,Footprint,LCSC,${QUANTITY},${DNP}'
+          schematic_output_bom_labels: 'Designator,Comment,Footprint,LCSC Part #,Qty,DNP'
+          pcb_file_name: ./bbq20_keyboard.kicad_pcb
+          pcb_output_gerbers_and_drill: true
+          pcb_output_gerbers_and_drill_folder_name: gerbers
+          pcb_output_pos: true
+          pcb_output_pos_file_name: raw_positions.csv
+          pcb_output_pos_format: csv
+          pcb_output_pos_side: both
+
+      - name: Convert BOM and placement data to JLCPCB format
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import csv
+
+          def norm(s):
+              return (s or "").strip()
+
+          # BOM
+          with open("raw_bom.csv", newline="", encoding="utf-8-sig") as f:
+              rows = list(csv.DictReader(f))
+
+          out_rows, missing = [], []
+          for r in rows:
+              designator = norm(r.get("Designator") or r.get("Reference"))
+              comment = norm(r.get("Comment") or r.get("Value"))
+              footprint = norm(r.get("Footprint"))
+              lcsc = norm(r.get("LCSC Part #") or r.get("LCSC"))
+              dnp = norm(r.get("DNP")).lower()
+
+              if not designator or dnp in {"1","true","yes","y","dnp"}:
+                  continue
+              if designator.startswith("G***") or designator in {"H1","H2"}:
+                  continue
+
+              out_rows.append({
+                  "Comment": comment,
+                  "Designator": designator,
+                  "Footprint": footprint,
+                  "LCSC Part #": lcsc,
+              })
+              if not lcsc:
+                  missing.append((designator, comment, footprint))
+
+          with open("bom_jlcpcb.csv", "w", newline="", encoding="utf-8") as f:
+              w = csv.DictWriter(f, fieldnames=[
+                  "Comment","Designator","Footprint","LCSC Part #"
+              ])
+              w.writeheader()
+              w.writerows(out_rows)
+
+          with open("missing_lcsc.txt", "w", encoding="utf-8") as f:
+              if missing:
+                  f.write("Components with blank LCSC fields:\n")
+                  for ref,val,fp in missing:
+                      f.write(f"{ref}: {val} | {fp}\n")
+              else:
+                  f.write("No blank LCSC fields found.\n")
+
+          # CPL
+          with open("raw_positions.csv", newline="", encoding="utf-8-sig") as f:
+              prows = list(csv.DictReader(f))
+
+          def get(r, *names):
+              lower = {str(k).strip().lower(): v for k,v in r.items()}
+              for n in names:
+                  if n.lower() in lower:
+                      return norm(lower[n.lower()])
+              return ""
+
+          parsed = []
+          for r in prows:
+              ref = get(r, "Ref", "Reference", "Designator")
+              x = get(r, "PosX", "Mid X", "X")
+              y = get(r, "PosY", "Mid Y", "Y")
+              rot = get(r, "Rot", "Rotation")
+              side = get(r, "Side", "Layer").lower()
+              if not ref:
+                  continue
+              parsed.append((ref, float(x), float(y), rot, side))
+
+          if not parsed:
+              raise SystemExit("No placement rows parsed")
+
+          # kicad-cli POS output defaults to inches unless explicitly told otherwise.
+          # Detect inch-scale output by looking at the component-cloud SPAN, not
+          # the absolute coordinate values (the board itself may sit far from 0,0).
+          raw_xs = [x for _,x,_,_,_ in parsed]
+          raw_ys = [y for _,_,y,_,_ in parsed]
+          raw_xspan = max(raw_xs) - min(raw_xs)
+          raw_yspan = max(raw_ys) - min(raw_ys)
+
+          # BBQ20 component cloud should span tens of mm. If raw span is only a
+          # few units, it is inches and needs x25.4.
+          scale = 25.4 if max(raw_xspan, raw_yspan) < 10 else 1.0
+          units_note = "inches detected -> converted to mm" if scale == 25.4 else "mm detected"
+
+          cpl = []
+          for ref,x,y,rot,side in parsed:
+              if side in {"front","top","f","f.cu"}:
+                  layer = "Top"
+              elif side in {"back","bottom","b","b.cu"}:
+                  layer = "Bottom"
+              else:
+                  layer = side.title() if side else ""
+
+              cpl.append({
+                  "Designator": ref,
+                  "Mid X": f"{x*scale:.4f}",
+                  "Mid Y": f"{y*scale:.4f}",
+                  "Rotation": rot,
+                  "Layer": layer,
+              })
+
+          xs = [float(r["Mid X"]) for r in cpl]
+          ys = [float(r["Mid Y"]) for r in cpl]
+          xspan = max(xs)-min(xs)
+          yspan = max(ys)-min(ys)
+
+          # Validate only the SPAN. Absolute coordinates can legitimately be
+          # >150 mm because KiCad need not place the PCB near drawing origin.
+          if max(xspan, yspan) < 20 or min(xspan, yspan) < 10:
+              raise SystemExit(
+                  f"CPL coordinate span still looks collapsed: "
+                  f"{xspan:.2f} x {yspan:.2f} mm"
+              )
+          if max(xspan, yspan) > 100:
+              raise SystemExit(
+                  f"CPL coordinate span looks too large for a 74 x 53.1 mm board: "
+                  f"{xspan:.2f} x {yspan:.2f} mm"
+              )
+
+          with open("cpl_jlcpcb.csv", "w", newline="", encoding="utf-8") as f:
+              w = csv.DictWriter(f, fieldnames=[
+                  "Designator","Mid X","Mid Y","Rotation","Layer"
+              ])
+              w.writeheader()
+              w.writerows(cpl)
+
+          with open("cpl_validation.txt", "w", encoding="utf-8") as f:
+              f.write(f"Units handling: {units_note}\n")
+              f.write(f"Rows: {len(cpl)}\n")
+              f.write(f"Absolute X range: {min(xs):.2f} .. {max(xs):.2f} mm\n")
+              f.write(f"Absolute Y range: {min(ys):.2f} .. {max(ys):.2f} mm\n")
+              f.write(f"Component coordinate span: {xspan:.2f} x {yspan:.2f} mm\n")
+              f.write("Board outline: about 74 x 53.1 mm\n")
+
+          print(f"CPL units: {units_note}")
+          print(f"CPL absolute X: {min(xs):.2f} .. {max(xs):.2f} mm")
+          print(f"CPL absolute Y: {min(ys):.2f} .. {max(ys):.2f} mm")
+          print(f"CPL span: {xspan:.2f} x {yspan:.2f} mm")
+          PY
+
+      - name: Package Gerbers and drill files
+        shell: bash
+        run: |
+          cd gerbers
+          zip -r ../bbq20_jlcpcb_gerbers.zip .
+          cd ..
+
+      - name: Record upstream revision
+        shell: bash
+        run: |
+          {
+            echo "Source: https://github.com/solderparty/bbq20kbd_hw"
+            echo "Requested ref: ${{ inputs.source_ref }}"
+            echo "Resolved commit: $(git rev-parse HEAD)"
+            echo
+            echo "IMPORTANT: Inspect JLCPCB's placement preview before ordering."
+          } > manufacturing_manifest.txt
+
+      - name: Upload manufacturing package
+        uses: actions/upload-artifact@v4
+        with:
+          name: bbq20-jlcpcb-manufacturing-fixed-v2
+          if-no-files-found: error
+          path: |
+            bbq20_jlcpcb_gerbers.zip
+            bom_jlcpcb.csv
+            cpl_jlcpcb.csv
+            missing_lcsc.txt
+            cpl_validation.txt
+            manufacturing_manifest.txt
+            raw_bom.csv
+            raw_positions.csv
